@@ -1,0 +1,6 @@
+[build]
+builder = "RAILPACK"
+
+[deploy]
+startCommand = "streamlit run streamlit_app.py --server.port $PORT --server.address 0.0.0.0"
+restartPolicyType = "ALWAYS"
