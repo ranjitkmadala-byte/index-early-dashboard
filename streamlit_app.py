@@ -36,8 +36,16 @@ def tail_count(vals, pred):
     return n
 
 def option_points(score,persist):
+    # Six-of-six option breadth is worth 3 points. Persistence is a separate
+    # confirmation point; previously it was added and then accidentally capped.
     p=3 if score>=6 else 2.5 if score>=5 else 2 if score>=4 else 1 if score>=3 else 0
-    return min(3,p+(0.5 if persist>=3 else 0))
+    return min(4,p+(1 if persist>=3 else 0))
+
+def session_move_points(change_pct):
+    """Score cumulative movement from the 09:18 baseline, not index points."""
+    if pd.isna(change_pct): return 0
+    move=abs(float(change_pct))
+    return 2 if move>=0.50 else 1 if move>=0.25 else 0
 
 @st.cache_data(ttl=20)
 def load_all():
@@ -94,27 +102,54 @@ def state_history(symbol,eng,optb,agg):
             long_p=tail_count(lf.astype(int),lambda x:x==1)
             short_p=tail_count(sf.astype(int),lambda x:x==1)
             if pd.notna(imb):
-                if imb>=20: bull+=2 if buy_p>=3 else 1
-                elif imb<=-20: bear+=2 if sell_p>=3 else 1
+                # Aggression is supporting evidence, capped at one point. It
+                # must not overpower a persistent six-option structure.
+                if imb>=20: bull+=1
+                elif imb<=-20: bear+=1
             if pd.notna(px):
-                if px>0: bull+=2 if long_p>=2 else 1
-                elif px<0: bear+=2 if short_p>=2 else 1
-            if pd.notna(oi) and oi>0 and pd.notna(px):
+                if px>0.02: bull+=1
+                elif px<-0.02: bear+=1
+            # Ignore tiny three-minute OI noise. OI only confirms direction
+            # when price and OI expand together.
+            if pd.notna(oi) and oi>=0.10 and pd.notna(px):
                 if px>0: bull+=2 if long_p>=2 else 1
                 elif px<0: bear+=2 if short_p>=2 else 1
 
-        cumoi=None
+        cumoi=session_px=None
         if not ee.empty:
-            cumoi=pd.to_numeric(ee.iloc[-1].future_oi_change_pct_t0,errors="coerce")
-            # Add one point once cumulative OI has reached 4%.
-            if pd.notna(cumoi) and cumoi>=4:
-                if bull>bear: bull+=1
-                elif bear>bull: bear+=1
+            latest=ee.iloc[-1]
+            cumoi=pd.to_numeric(latest.future_oi_change_pct_t0,errors="coerce")
+            if "spot_change_pct_t0" in ee.columns:
+                session_px=pd.to_numeric(latest.spot_change_pct_t0,errors="coerce")
+            # Fallback keeps the dashboard compatible while the revised
+            # collector is being deployed and old rows lack the new column.
+            if pd.isna(session_px):
+                spots=pd.to_numeric(ee.spot,errors="coerce").dropna()
+                if len(spots) and spots.iloc[0]:
+                    session_px=(spots.iloc[-1]/spots.iloc[0]-1)*100
+
+            smp=session_move_points(session_px)
+            if pd.notna(session_px):
+                if session_px>0: bull+=smp
+                elif session_px<0: bear+=smp
+
+            # Structural confluence: a >=0.50% session move aligned with at
+            # least five of six options earns one additional point.
+            if pd.notna(session_px) and session_px>=0.50 and bo>=5: bull+=1
+            elif pd.notna(session_px) and session_px<=-0.50 and so>=5: bear+=1
+
+            # Cumulative OI inside +/-1% is neutral. Positive OI beyond 1%
+            # confirms the price direction; falling OI is descriptive only.
+            if pd.notna(cumoi) and cumoi>=1 and pd.notna(session_px):
+                if session_px>0: bull+=1
+                elif session_px<0: bear+=1
 
         bull=min(10,bull); bear=min(10,bear)
         direction="LONG" if bull>bear else "SHORT" if bear>bull else "MIXED"
         score=max(bull,bear)
         conflict=bull>=4 and bear>=4
+        structural_bull=pd.notna(session_px) and session_px>=0.50 and bo>=5 and so<=1
+        structural_bear=pd.notna(session_px) and session_px<=-0.50 and so>=5 and bo<=1
         absorption=None
         if pd.notna(imb) and pd.notna(px):
             if imb<=-20 and px>=0: absorption="SELL ABSORPTION"
@@ -122,7 +157,11 @@ def state_history(symbol,eng,optb,agg):
 
         if conflict:
             state,conv="CONFLICT","CONFLICT"
-        elif absorption and score<8:
+        elif structural_bull and ((pd.notna(px) and px<=0.05) or (pd.notna(imb) and imb<0)):
+            state,conv="BULLISH CONSOLIDATION","HIGH"
+        elif structural_bear and ((pd.notna(px) and px>=-0.05) or (pd.notna(imb) and imb>0)):
+            state,conv="BEARISH CONSOLIDATION","HIGH"
+        elif absorption and score<6:
             state,conv=absorption,"WARNING"
         elif score>=8:
             state=("ACCELERATING "+direction) if pd.notna(cumoi) and cumoi>=4 else ("CONFIRMED "+direction)
@@ -139,7 +178,8 @@ def state_history(symbol,eng,optb,agg):
                      "direction":direction,"bull_score":bull,"bear_score":bear,
                      "option_bull_score":bo,"option_bear_score":so,"option_persistence":max(bp,sp),
                      "qty_imbalance":imb,"aggression_persistence":max(buy_p,sell_p),
-                     "price_3m_pct":px,"oi_3m_pct":oi,"cumulative_oi_pct":cumoi})
+                     "session_price_pct":session_px,"price_3m_pct":px,
+                     "oi_3m_pct":oi,"cumulative_oi_pct":cumoi})
     return pd.DataFrame(hist)
 
 d,eng,opt,agg,uni=load_all()
@@ -180,6 +220,7 @@ with tabs[0]:
             "opt_persist":cur.option_persistence,
             "qty_imbalance_pct":cur.qty_imbalance,
             "agg_persist":cur.aggression_persistence,
+            "session_price_pct":cur.session_price_pct,
             "fut_price_3m_pct":cur.price_3m_pct,
             "fut_oi_3m_pct":cur.oi_3m_pct,
             "total_oi_build_pct":cur.cumulative_oi_pct,
@@ -193,7 +234,8 @@ with tabs[0]:
         if h.empty: continue
         with st.expander(f"{sym} state lifecycle"):
             view=h[["ts","state","conviction","score","option_bull_score","option_bear_score",
-                    "qty_imbalance","price_3m_pct","oi_3m_pct","cumulative_oi_pct"]].copy()
+                    "qty_imbalance","session_price_pct","price_3m_pct","oi_3m_pct",
+                    "cumulative_oi_pct"]].copy()
             view["ts"]=view["ts"].apply(lambda x:tist(x).strftime("%H:%M:%S"))
             st.dataframe(view,use_container_width=True,hide_index=True)
 
