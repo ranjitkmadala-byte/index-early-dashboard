@@ -96,9 +96,32 @@ def state_history(symbol,eng,optb,agg):
         up=int((pxs>0.05).sum()); dn=int((pxs<-0.05).sum())
         bp=2.0 if len(pxs)>=3 and up==3 else 1.0 if up>=2 else 0.0; sp=2.0 if len(pxs)>=3 and dn==3 else 1.0 if dn>=2 else 0.0
 
-        bo=so=0.0; sign=1 if pd.notna(session_px) and session_px>0 else -1 if pd.notna(session_px) and session_px<0 else 0
-        if pd.notna(oi) and oi>=0.10: bo += 1 if sign>0 else 0; so += 1 if sign<0 else 0
-        if pd.notna(cumoi) and cumoi>=1.0: bo += 1 if sign>0 else 0; so += 1 if sign<0 else 0
+        # Index-calibrated fresh OI /2 is DIRECTION-NEUTRAL positioning evidence.
+        # 1 point: current 3m OI >= +0.05%
+        # 2 points: 3 consecutive 3m OI observations >= +0.05%
+        oi_points=0.0
+        fresh_oi_persist=0
+        if not ee.empty and "fresh_oi_confirmation_points" in ee.columns:
+            oi_points=pd.to_numeric(ee.iloc[-1].get("fresh_oi_confirmation_points"),errors="coerce")
+            oi_points=float(oi_points) if pd.notna(oi_points) else 0.0
+            fresh_oi_persist=pd.to_numeric(ee.iloc[-1].get("fresh_oi_persistence"),errors="coerce")
+            fresh_oi_persist=int(fresh_oi_persist) if pd.notna(fresh_oi_persist) else 0
+        else:
+            ois_recent=pd.to_numeric(
+                eg[pd.to_datetime(eg.ts)<=ts].get("future_oi_change_3m_pct",pd.Series(dtype=float)),
+                errors="coerce"
+            ).dropna().tail(3)
+            if pd.notna(oi) and oi>=0.05:
+                oi_points=1.0
+            if len(ois_recent)>=3 and bool((ois_recent>=0.05).all()):
+                oi_points=2.0
+                fresh_oi_persist=3
+
+        positioning_state = (
+            "OI BUILDING — DIRECTION UNRESOLVED" if oi_points>=2
+            else "FRESH OI" if oi_points>=1
+            else "NO MATERIAL FRESH OI"
+        )
 
         fstate="UNKNOWN"; persist=0; statepts=0.0
         if pd.notna(px) and pd.notna(oi):
@@ -129,21 +152,45 @@ def state_history(symbol,eng,optb,agg):
         bi=si=0.0
         if pd.notna(imb): bi=0.5 if imb>=20 else 0.0; si=0.5 if imb<=-20 else 0.0
 
-        bull=min(10.0,bp+bo+bs+bf+bpc+ba+bi); bear=min(10.0,sp+so+ss+sf+spc+sa+si)
-        direction="LONG" if bull>bear else "SHORT" if bear>bull else "MIXED"; score=max(bull,bear)
-        state="HIGH CONVICTION "+direction if score>=8.5 else "CONFIRMED "+direction if score>=7 else "BUILDING "+direction if score>=6 else "WATCH "+direction if score>=4 else "NEUTRAL"
+        # Directional score excludes direction-neutral OI points until price/state resolves.
+        bull=min(8.0,bp+bs+bf+bpc+ba+bi)
+        bear=min(8.0,sp+ss+sf+spc+sa+si)
+        direction="LONG" if bull>bear else "SHORT" if bear>bull else "MIXED"
+
+        # Full conviction score includes fresh-positioning OI /2, but do not call
+        # it CONFIRMED directional unless directional evidence itself is strong.
+        score=min(10.0,max(bull,bear)+oi_points)
+        directional_score=max(bull,bear)
+
+        if oi_points>=2 and directional_score<4:
+            state="OI BUILDING — DIRECTION UNRESOLVED"
+        elif score>=8.5 and directional_score>=6:
+            state="HIGH CONVICTION "+direction
+        elif score>=7 and directional_score>=5:
+            state="CONFIRMED "+direction
+        elif score>=6 and directional_score>=4:
+            state="BUILDING "+direction
+        elif directional_score>=4:
+            state="WATCH "+direction
+        elif oi_points>=1:
+            state="FRESH OI — DIRECTION UNRESOLVED"
+        else:
+            state="NEUTRAL"
         conv="VERY HIGH" if score>=8.5 else "HIGH" if score>=7 else "MEDIUM" if score>=6 else "LOW"
         hist.append({"symbol":symbol,"ts":ts,"state":state,"conviction":conv,"score":score,"direction":direction,"bull_score":bull,"bear_score":bear,
                      "option_bull_score":0,"option_bear_score":0,"option_persistence":0,"qty_imbalance":imb,"aggression_persistence":0,
                      "session_price_pct":session_px,"price_3m_pct":px,"oi_3m_pct":oi,"cumulative_oi_pct":cumoi,
-                     "price_persistence_points":max(bp,sp),"oi_confirmation_points":max(bo,so),"futures_state":fstate,"futures_state_persistence":persist,
+                     "price_persistence_points":max(bp,sp),"oi_confirmation_points":oi_points,
+                     "fresh_oi_persistence":fresh_oi_persist,"positioning_state":positioning_state,
+                     "directional_score":directional_score,
+                     "futures_state":fstate,"futures_state_persistence":persist,
                      "futures_state_points":statepts,"total_flow_3m_cr":flow,"money_flow_acceleration_x":flowx,"money_flow_points":fp,
                      "pcr_trend_9m":pcrt,"pcr_trend_points":max(bpc,spc),"aggression_points":max(ba,sa),"imbalance_points":max(bi,si)})
     return pd.DataFrame(hist)
 
 d,eng,opt,agg,uni=load_all()
-st.title("NIFTY + BANKNIFTY — Early Detector v2.9 Structure-First")
-st.caption("Score /10: Price persistence 2 • Futures OI 2 • Futures-state persistence 2 • Money-flow expansion 1.5 • PCR trend 1 • Aggression 1 • Qty imbalance 0.5")
+st.title("NIFTY + BANKNIFTY — Early Detector v3.0 Index-Calibrated")
+st.caption("Score /10: Price persistence 2 • Fresh OI positioning 2 (direction-neutral) • Futures-state persistence 2 • Money-flow expansion 1.5 • PCR trend 1 • Aggression 1 • Qty imbalance 0.5. Fresh OI alone can show OI BUILDING — DIRECTION UNRESOLVED.")
 
 if d is None:
     st.info("Waiting for index collector data.")
