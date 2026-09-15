@@ -73,118 +73,77 @@ def build_option_basket(opt):
 
 def state_history(symbol,eng,optb,agg):
     eg=eng[eng.symbol.eq(symbol)].sort_values("ts").reset_index(drop=True)
-    og=optb[optb.symbol.eq(symbol)].sort_values("ts").reset_index(drop=True)
     ag=agg[agg.symbol.eq(symbol)].sort_values("ts").reset_index(drop=True)
-    times=sorted(set(pd.to_datetime(eg.ts).tolist()+pd.to_datetime(og.ts).tolist()+pd.to_datetime(ag.ts).tolist()))
+    times=sorted(set(pd.to_datetime(eg.ts).tolist()+pd.to_datetime(ag.ts).tolist()))
     hist=[]
     for ts in times:
-        oe=og[pd.to_datetime(og.ts)<=ts]
-        aa=ag[pd.to_datetime(ag.ts)<=ts]
-        ee=eg[pd.to_datetime(eg.ts)<=ts]
-        bo=so=bp=sp=0
-        if not oe.empty:
-            bo=int(oe.iloc[-1].bull_option_score); so=int(oe.iloc[-1].bear_option_score)
-            bp=tail_count(oe.bull_option_score,lambda x:x>=5)
-            sp=tail_count(oe.bear_option_score,lambda x:x>=5)
-        bull=option_points(bo,bp); bear=option_points(so,sp)
-        imb=px=oi=None; buy_p=sell_p=long_p=short_p=0
+        ee=eg[pd.to_datetime(eg.ts)<=ts]; aa=ag[pd.to_datetime(ag.ts)<=ts]
+        px=oi=imb=td=cumoi=session_px=None
         if not aa.empty:
-            a=aa.iloc[-1]
-            imb=pd.to_numeric(a.total_qty_imbalance,errors="coerce")
-            px=pd.to_numeric(a.price_change_3m_pct,errors="coerce")
-            oi=pd.to_numeric(a.oi_change_3m_pct,errors="coerce")
-            buy_p=tail_count(aa.total_qty_imbalance,lambda x:x>=20)
-            sell_p=tail_count(aa.total_qty_imbalance,lambda x:x<=-20)
-            imbs=pd.to_numeric(aa.total_qty_imbalance,errors="coerce")
-            pxs=pd.to_numeric(aa.price_change_3m_pct,errors="coerce")
-            ois=pd.to_numeric(aa.oi_change_3m_pct,errors="coerce")
-            lf=(imbs>=20)&(pxs>0)&(ois>0); sf=(imbs<=-20)&(pxs<0)&(ois>0)
-            long_p=tail_count(lf.astype(int),lambda x:x==1)
-            short_p=tail_count(sf.astype(int),lambda x:x==1)
-            if pd.notna(imb):
-                # Aggression is supporting evidence, capped at one point. It
-                # must not overpower a persistent six-option structure.
-                if imb>=20: bull+=1
-                elif imb<=-20: bear+=1
-            if pd.notna(px):
-                if px>0.02: bull+=1
-                elif px<-0.02: bear+=1
-            # Ignore tiny three-minute OI noise. OI only confirms direction
-            # when price and OI expand together.
-            if pd.notna(oi) and oi>=0.10 and pd.notna(px):
-                if px>0: bull+=2 if long_p>=2 else 1
-                elif px<0: bear+=2 if short_p>=2 else 1
-
-        cumoi=session_px=None
+            ar=aa.iloc[-1]; px=pd.to_numeric(ar.get("price_change_3m_pct"),errors="coerce"); oi=pd.to_numeric(ar.get("oi_change_3m_pct"),errors="coerce")
+            imb=pd.to_numeric(ar.get("total_qty_imbalance"),errors="coerce"); td=pd.to_numeric(ar.get("delta_pct"),errors="coerce")
         if not ee.empty:
-            latest=ee.iloc[-1]
-            cumoi=pd.to_numeric(latest.future_oi_change_pct_t0,errors="coerce")
-            if "spot_change_pct_t0" in ee.columns:
-                session_px=pd.to_numeric(latest.spot_change_pct_t0,errors="coerce")
-            # Fallback keeps the dashboard compatible while the revised
-            # collector is being deployed and old rows lack the new column.
-            if pd.isna(session_px):
-                spots=pd.to_numeric(ee.spot,errors="coerce").dropna()
-                if len(spots) and spots.iloc[0]:
-                    session_px=(spots.iloc[-1]/spots.iloc[0]-1)*100
+            er=ee.iloc[-1]
+            if "future_price_change_3m_pct" in ee.columns:
+                v=pd.to_numeric(er.get("future_price_change_3m_pct"),errors="coerce"); px=v if pd.notna(v) else px
+            if "future_oi_change_3m_pct" in ee.columns:
+                v=pd.to_numeric(er.get("future_oi_change_3m_pct"),errors="coerce"); oi=v if pd.notna(v) else oi
+            cumoi=pd.to_numeric(er.get("future_oi_change_pct_t0"),errors="coerce"); session_px=pd.to_numeric(er.get("spot_change_pct_t0"),errors="coerce")
 
-            smp=session_move_points(session_px)
-            if pd.notna(session_px):
-                if session_px>0: bull+=smp
-                elif session_px<0: bear+=smp
+        recent=eg[pd.to_datetime(eg.ts)<=ts].tail(3)
+        pxs=pd.to_numeric(recent.get("future_price_change_3m_pct",pd.Series(dtype=float)),errors="coerce").dropna()
+        if pxs.empty and not aa.empty: pxs=pd.to_numeric(aa.tail(3).price_change_3m_pct,errors="coerce").dropna()
+        up=int((pxs>0.05).sum()); dn=int((pxs<-0.05).sum())
+        bp=2.0 if len(pxs)>=3 and up==3 else 1.0 if up>=2 else 0.0; sp=2.0 if len(pxs)>=3 and dn==3 else 1.0 if dn>=2 else 0.0
 
-            # Structural confluence: a >=0.50% session move aligned with at
-            # least five of six options earns one additional point.
-            if pd.notna(session_px) and session_px>=0.50 and bo>=5: bull+=1
-            elif pd.notna(session_px) and session_px<=-0.50 and so>=5: bear+=1
+        bo=so=0.0; sign=1 if pd.notna(session_px) and session_px>0 else -1 if pd.notna(session_px) and session_px<0 else 0
+        if pd.notna(oi) and oi>=0.10: bo += 1 if sign>0 else 0; so += 1 if sign<0 else 0
+        if pd.notna(cumoi) and cumoi>=1.0: bo += 1 if sign>0 else 0; so += 1 if sign<0 else 0
 
-            # Cumulative OI inside +/-1% is neutral. Positive OI beyond 1%
-            # confirms the price direction; falling OI is descriptive only.
-            if pd.notna(cumoi) and cumoi>=1 and pd.notna(session_px):
-                if session_px>0: bull+=1
-                elif session_px<0: bear+=1
-
-        bull=min(10,bull); bear=min(10,bear)
-        direction="LONG" if bull>bear else "SHORT" if bear>bull else "MIXED"
-        score=max(bull,bear)
-        conflict=bull>=4 and bear>=4
-        structural_bull=pd.notna(session_px) and session_px>=0.50 and bo>=5 and so<=1
-        structural_bear=pd.notna(session_px) and session_px<=-0.50 and so>=5 and bo<=1
-        absorption=None
-        if pd.notna(imb) and pd.notna(px):
-            if imb<=-20 and px>=0: absorption="SELL ABSORPTION"
-            elif imb>=20 and px<=0: absorption="BUY ABSORPTION"
-
-        if conflict:
-            state,conv="CONFLICT","CONFLICT"
-        elif structural_bull and ((pd.notna(px) and px<=0.05) or (pd.notna(imb) and imb<0)):
-            state,conv="BULLISH CONSOLIDATION","HIGH"
-        elif structural_bear and ((pd.notna(px) and px>=-0.05) or (pd.notna(imb) and imb>0)):
-            state,conv="BEARISH CONSOLIDATION","HIGH"
-        elif absorption and score<6:
-            state,conv=absorption,"WARNING"
-        elif score>=8:
-            state=("ACCELERATING "+direction) if pd.notna(cumoi) and cumoi>=4 else ("CONFIRMED "+direction)
-            conv="VERY HIGH"
-        elif score>=6:
-            state,conv="CONFIRMED "+direction,"HIGH"
-        elif score>=4:
-            state,conv="BUILDING "+direction,"MEDIUM"
-        elif score>=2:
-            state,conv="WATCH "+direction,"LOW"
+        fstate="UNKNOWN"; persist=0; statepts=0.0
+        if pd.notna(px) and pd.notna(oi):
+            fstate="LONG_BUILDUP" if px>0 and oi>0 else "SHORT_BUILDUP" if px<0 and oi>0 else "SHORT_COVERING" if px>0 and oi<0 else "LONG_UNWINDING" if px<0 and oi<0 else "MIXED"
+        src=eg[pd.to_datetime(eg.ts)<=ts]
+        if {"future_price_change_3m_pct","future_oi_change_3m_pct"}.issubset(src.columns):
+            ps=pd.to_numeric(src.future_price_change_3m_pct,errors="coerce"); os_=pd.to_numeric(src.future_oi_change_3m_pct,errors="coerce")
         else:
-            state,conv="NEUTRAL","LOW"
-        hist.append({"symbol":symbol,"ts":ts,"state":state,"conviction":conv,"score":score,
-                     "direction":direction,"bull_score":bull,"bear_score":bear,
-                     "option_bull_score":bo,"option_bear_score":so,"option_persistence":max(bp,sp),
-                     "qty_imbalance":imb,"aggression_persistence":max(buy_p,sell_p),
-                     "session_price_pct":session_px,"price_3m_pct":px,
-                     "oi_3m_pct":oi,"cumulative_oi_pct":cumoi})
+            src=aa; ps=pd.to_numeric(src.price_change_3m_pct,errors="coerce") if not src.empty else pd.Series(dtype=float); os_=pd.to_numeric(src.oi_change_3m_pct,errors="coerce") if not src.empty else pd.Series(dtype=float)
+        lp=tail_count(((ps>0)&(os_>0)).astype(int),lambda x:x==1); shp=tail_count(((ps<0)&(os_>0)).astype(int),lambda x:x==1)
+        persist=lp if fstate=="LONG_BUILDUP" else shp if fstate=="SHORT_BUILDUP" else 0; statepts=2.0 if persist>=3 else 1.0 if persist>=2 else 0.0
+        bs=statepts if fstate=="LONG_BUILDUP" else 0.0; ss=statepts if fstate=="SHORT_BUILDUP" else 0.0
+
+        flow=flowx=None; fp=0.0
+        if not ee.empty and "total_flow_3m_cr" in ee.columns:
+            fs=pd.to_numeric(ee.total_flow_3m_cr,errors="coerce"); flow=fs.iloc[-1]; prior=fs.iloc[:-1].dropna().tail(5)
+            if pd.notna(flow) and len(prior)>=3 and prior.mean()>0: flowx=float(flow/prior.mean()); fp=1.5 if flowx>=2 else 1.0 if flowx>=1.5 else 0.0
+        bf=fp if pd.notna(px) and px>0 else 0.0; sf=fp if pd.notna(px) and px<0 else 0.0
+
+        pcrt=None; bpc=spc=0.0
+        if not ee.empty and "pcr_change_3m" in ee.columns:
+            pc=pd.to_numeric(ee.pcr_change_3m,errors="coerce").dropna().tail(3)
+            if len(pc)>=2:
+                pcrt=float(pc.sum()); bpc=1.0 if int((pc>0).sum())>=2 and pcrt>0 else 0.0; spc=1.0 if int((pc<0).sum())>=2 and pcrt<0 else 0.0
+
+        ba=sa=0.0
+        if pd.notna(td): ba=1.0 if td>=30 else 0.0; sa=1.0 if td<=-30 else 0.0
+        bi=si=0.0
+        if pd.notna(imb): bi=0.5 if imb>=20 else 0.0; si=0.5 if imb<=-20 else 0.0
+
+        bull=min(10.0,bp+bo+bs+bf+bpc+ba+bi); bear=min(10.0,sp+so+ss+sf+spc+sa+si)
+        direction="LONG" if bull>bear else "SHORT" if bear>bull else "MIXED"; score=max(bull,bear)
+        state="HIGH CONVICTION "+direction if score>=8.5 else "CONFIRMED "+direction if score>=7 else "BUILDING "+direction if score>=6 else "WATCH "+direction if score>=4 else "NEUTRAL"
+        conv="VERY HIGH" if score>=8.5 else "HIGH" if score>=7 else "MEDIUM" if score>=6 else "LOW"
+        hist.append({"symbol":symbol,"ts":ts,"state":state,"conviction":conv,"score":score,"direction":direction,"bull_score":bull,"bear_score":bear,
+                     "option_bull_score":0,"option_bear_score":0,"option_persistence":0,"qty_imbalance":imb,"aggression_persistence":0,
+                     "session_price_pct":session_px,"price_3m_pct":px,"oi_3m_pct":oi,"cumulative_oi_pct":cumoi,
+                     "price_persistence_points":max(bp,sp),"oi_confirmation_points":max(bo,so),"futures_state":fstate,"futures_state_persistence":persist,
+                     "futures_state_points":statepts,"total_flow_3m_cr":flow,"money_flow_acceleration_x":flowx,"money_flow_points":fp,
+                     "pcr_trend_9m":pcrt,"pcr_trend_points":max(bpc,spc),"aggression_points":max(ba,sa),"imbalance_points":max(bi,si)})
     return pd.DataFrame(hist)
 
 d,eng,opt,agg,uni=load_all()
-st.title("NIFTY + BANKNIFTY — Early Detector")
-st.caption("Index Money Flow • Option basket • Futures aggression • Price/OI • OI acceleration")
+st.title("NIFTY + BANKNIFTY — Early Detector v2.9 Structure-First")
+st.caption("Score /10: Price persistence 2 • Futures OI 2 • Futures-state persistence 2 • Money-flow expansion 1.5 • PCR trend 1 • Aggression 1 • Qty imbalance 0.5")
 
 if d is None:
     st.info("Waiting for index collector data.")
@@ -235,7 +194,7 @@ with tabs[0]:
         with st.expander(f"{sym} state lifecycle"):
             view=h[["ts","state","conviction","score","option_bull_score","option_bear_score",
                     "qty_imbalance","session_price_pct","price_3m_pct","oi_3m_pct",
-                    "cumulative_oi_pct"]].copy()
+                    "cumulative_oi_pct","price_persistence_points","oi_confirmation_points","futures_state","futures_state_persistence","futures_state_points","total_flow_3m_cr","money_flow_acceleration_x","money_flow_points","pcr_trend_9m","pcr_trend_points","aggression_points","imbalance_points"]].copy()
             view["ts"]=view["ts"].apply(lambda x:tist(x).strftime("%H:%M:%S"))
             st.dataframe(view,use_container_width=True,hide_index=True)
 
