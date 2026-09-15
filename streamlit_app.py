@@ -90,11 +90,31 @@ def state_history(symbol,eng,optb,agg):
                 v=pd.to_numeric(er.get("future_oi_change_3m_pct"),errors="coerce"); oi=v if pd.notna(v) else oi
             cumoi=pd.to_numeric(er.get("future_oi_change_pct_t0"),errors="coerce"); session_px=pd.to_numeric(er.get("spot_change_pct_t0"),errors="coerce")
 
+        # v3.1 INDEX PRICE PERSISTENCE:
+        # Score the net move over the latest three 3-minute observations (about 9 minutes)
+        # instead of requiring each individual bar to exceed +/-0.05%.
         recent=eg[pd.to_datetime(eg.ts)<=ts].tail(3)
         pxs=pd.to_numeric(recent.get("future_price_change_3m_pct",pd.Series(dtype=float)),errors="coerce").dropna()
-        if pxs.empty and not aa.empty: pxs=pd.to_numeric(aa.tail(3).price_change_3m_pct,errors="coerce").dropna()
-        up=int((pxs>0.05).sum()); dn=int((pxs<-0.05).sum())
-        bp=2.0 if len(pxs)>=3 and up==3 else 1.0 if up>=2 else 0.0; sp=2.0 if len(pxs)>=3 and dn==3 else 1.0 if dn>=2 else 0.0
+        if pxs.empty and not aa.empty:
+            pxs=pd.to_numeric(aa.tail(3).price_change_3m_pct,errors="coerce").dropna()
+
+        bp=sp=0.0
+        if len(pxs)>=3:
+            net_9m=float(pxs.tail(3).sum())
+            nonneg=int((pxs.tail(3)>=0).sum())
+            nonpos=int((pxs.tail(3)<=0).sum())
+
+            # 1 point: meaningful net 9m move in the direction.
+            # 2 points: >=0.10% net move AND at least 2 of 3 bars aligned.
+            if net_9m>=0.10 and nonneg>=2:
+                bp=2.0
+            elif net_9m>=0.05:
+                bp=1.0
+
+            if net_9m<=-0.10 and nonpos>=2:
+                sp=2.0
+            elif net_9m<=-0.05:
+                sp=1.0
 
         # Index-calibrated fresh OI /2 is DIRECTION-NEUTRAL positioning evidence.
         # 1 point: current 3m OI >= +0.05%
@@ -147,8 +167,12 @@ def state_history(symbol,eng,optb,agg):
             if len(pc)>=2:
                 pcrt=float(pc.sum()); bpc=1.0 if int((pc>0).sum())>=2 and pcrt>0 else 0.0; spc=1.0 if int((pc<0).sum())>=2 and pcrt<0 else 0.0
 
+        # v3.1 GRADUATED EXECUTED AGGRESSION:
+        # +/-20% to <30% earns 0.5; +/-30% or stronger earns 1.0.
         ba=sa=0.0
-        if pd.notna(td): ba=1.0 if td>=30 else 0.0; sa=1.0 if td<=-30 else 0.0
+        if pd.notna(td):
+            ba=1.0 if td>=30 else 0.5 if td>=20 else 0.0
+            sa=1.0 if td<=-30 else 0.5 if td<=-20 else 0.0
         bi=si=0.0
         if pd.notna(imb): bi=0.5 if imb>=20 else 0.0; si=0.5 if imb<=-20 else 0.0
 
@@ -189,8 +213,8 @@ def state_history(symbol,eng,optb,agg):
     return pd.DataFrame(hist)
 
 d,eng,opt,agg,uni=load_all()
-st.title("NIFTY + BANKNIFTY — Early Detector v3.0 Index-Calibrated")
-st.caption("Score /10: Price persistence 2 • Fresh OI positioning 2 (direction-neutral) • Futures-state persistence 2 • Money-flow expansion 1.5 • PCR trend 1 • Aggression 1 • Qty imbalance 0.5. Fresh OI alone can show OI BUILDING — DIRECTION UNRESOLVED.")
+st.title("NIFTY + BANKNIFTY — Early Detector v3.1 Index-Calibrated")
+st.caption("Score /10: 9-minute price persistence 2 • Fresh OI positioning 2 (direction-neutral) • Futures-state persistence 2 • Money-flow expansion 1.5 • PCR trend 1 • Graduated aggression 1 • Qty imbalance 0.5. CONFIRMED still requires total >=7 and directional >=5.")
 
 if d is None:
     st.info("Waiting for index collector data.")
