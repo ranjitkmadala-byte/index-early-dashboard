@@ -71,11 +71,44 @@ def build_option_basket(opt):
         rows.append({"symbol":sym,"ts":ts,"bull_option_score":bull,"bear_option_score":bear})
     return pd.DataFrame(rows).sort_values(["symbol","ts"])
 
+
+def _dir_regime(price_3m, oi_3m):
+    if pd.isna(price_3m) or pd.isna(oi_3m):
+        return "UNKNOWN"
+    if price_3m > 0 and oi_3m > 0:
+        return "FRESH LONG BUILD"
+    if price_3m > 0 and oi_3m < 0:
+        return "BULLISH SHORT COVERING"
+    if price_3m < 0 and oi_3m > 0:
+        return "FRESH SHORT BUILD"
+    if price_3m < 0 and oi_3m < 0:
+        return "BEARISH LONG UNWINDING"
+    return "MIXED"
+
+def _option_regime(er):
+    ce = pd.to_numeric(er.get("call_oi_change_t0"), errors="coerce")
+    pe = pd.to_numeric(er.get("put_oi_change_t0"), errors="coerce")
+    state = str(er.get("oi_50pct_state") or "")
+    bull = (
+        state == "PUT BUILD / CALL UNWIND"
+        or (pd.notna(pe) and pd.notna(ce) and pe > 0 and (ce < 0 or pe >= 2 * max(float(ce), 0.0)))
+    )
+    bear = (
+        state == "CALL BUILD / PUT UNWIND"
+        or (pd.notna(pe) and pd.notna(ce) and ce > 0 and (pe < 0 or ce >= 2 * max(float(pe), 0.0)))
+    )
+    return ce, pe, state, bull, bear
+
 def state_history(symbol,eng,optb,agg):
     eg=eng[eng.symbol.eq(symbol)].sort_values("ts").reset_index(drop=True)
     ag=agg[agg.symbol.eq(symbol)].sort_values("ts").reset_index(drop=True)
     times=sorted(set(pd.to_datetime(eg.ts).tolist()+pd.to_datetime(ag.ts).tolist()))
     hist=[]
+    locked_direction=None
+    lock_remaining=0
+    prior_direction=None
+    prior_bull=0.0
+    prior_bear=0.0
     for ts in times:
         ee=eg[pd.to_datetime(eg.ts)<=ts]; aa=ag[pd.to_datetime(ag.ts)<=ts]
         px=oi=imb=td=cumoi=session_px=None
@@ -143,50 +176,141 @@ def state_history(symbol,eng,optb,agg):
             else "NO MATERIAL FRESH OI"
         )
 
-        fstate="UNKNOWN"; persist=0; statepts=0.0
-        if pd.notna(px) and pd.notna(oi):
-            fstate="LONG_BUILDUP" if px>0 and oi>0 else "SHORT_BUILDUP" if px<0 and oi>0 else "SHORT_COVERING" if px>0 and oi<0 else "LONG_UNWINDING" if px<0 and oi<0 else "MIXED"
+        # v3.2 FOUR-REGIME + REVERSAL/DECAY MODEL
+        fstate=_dir_regime(px,oi)
         src=eg[pd.to_datetime(eg.ts)<=ts]
         if {"future_price_change_3m_pct","future_oi_change_3m_pct"}.issubset(src.columns):
-            ps=pd.to_numeric(src.future_price_change_3m_pct,errors="coerce"); os_=pd.to_numeric(src.future_oi_change_3m_pct,errors="coerce")
+            ps=pd.to_numeric(src.future_price_change_3m_pct,errors="coerce")
+            os_=pd.to_numeric(src.future_oi_change_3m_pct,errors="coerce")
         else:
-            src=aa; ps=pd.to_numeric(src.price_change_3m_pct,errors="coerce") if not src.empty else pd.Series(dtype=float); os_=pd.to_numeric(src.oi_change_3m_pct,errors="coerce") if not src.empty else pd.Series(dtype=float)
-        lp=tail_count(((ps>0)&(os_>0)).astype(int),lambda x:x==1); shp=tail_count(((ps<0)&(os_>0)).astype(int),lambda x:x==1)
-        persist=lp if fstate=="LONG_BUILDUP" else shp if fstate=="SHORT_BUILDUP" else 0; statepts=2.0 if persist>=3 else 1.0 if persist>=2 else 0.0
-        bs=statepts if fstate=="LONG_BUILDUP" else 0.0; ss=statepts if fstate=="SHORT_BUILDUP" else 0.0
+            src=aa
+            ps=pd.to_numeric(src.price_change_3m_pct,errors="coerce") if not src.empty else pd.Series(dtype=float)
+            os_=pd.to_numeric(src.oi_change_3m_pct,errors="coerce") if not src.empty else pd.Series(dtype=float)
+
+        regimes=[_dir_regime(p,o) for p,o in zip(ps.tail(4),os_.tail(4))]
+        bull_regimes={"FRESH LONG BUILD","BULLISH SHORT COVERING"}
+        bear_regimes={"FRESH SHORT BUILD","BEARISH LONG UNWINDING"}
+        bull_last3=sum(r in bull_regimes for r in regimes[-3:])
+        bear_last3=sum(r in bear_regimes for r in regimes[-3:])
+        bull_last4=sum(r in bull_regimes for r in regimes[-4:])
+        bear_last4=sum(r in bear_regimes for r in regimes[-4:])
+
+        persist=tail_count(regimes,lambda x: x==fstate) if regimes else 0
+        statepts=2.0 if persist>=3 else 1.0 if persist>=2 else 0.0
+        bs=statepts if fstate=="FRESH LONG BUILD" else 0.75*statepts if fstate=="BULLISH SHORT COVERING" else 0.0
+        ss=statepts if fstate=="FRESH SHORT BUILD" else 0.75*statepts if fstate=="BEARISH LONG UNWINDING" else 0.0
 
         flow=flowx=None; fp=0.0
         if not ee.empty and "total_flow_3m_cr" in ee.columns:
             fs=pd.to_numeric(ee.total_flow_3m_cr,errors="coerce"); flow=fs.iloc[-1]; prior=fs.iloc[:-1].dropna().tail(5)
-            if pd.notna(flow) and len(prior)>=3 and prior.mean()>0: flowx=float(flow/prior.mean()); fp=1.5 if flowx>=2 else 1.0 if flowx>=1.5 else 0.0
-        bf=fp if pd.notna(px) and px>0 else 0.0; sf=fp if pd.notna(px) and px<0 else 0.0
+            if pd.notna(flow) and len(prior)>=3 and prior.mean()>0:
+                flowx=float(flow/prior.mean()); fp=1.5 if flowx>=2 else 1.0 if flowx>=1.5 else 0.0
+        bf=fp if pd.notna(px) and px>0 else 0.0
+        sf=fp if pd.notna(px) and px<0 else 0.0
 
         pcrt=None; bpc=spc=0.0
         if not ee.empty and "pcr_change_3m" in ee.columns:
             pc=pd.to_numeric(ee.pcr_change_3m,errors="coerce").dropna().tail(3)
             if len(pc)>=2:
-                pcrt=float(pc.sum()); bpc=1.0 if int((pc>0).sum())>=2 and pcrt>0 else 0.0; spc=1.0 if int((pc<0).sum())>=2 and pcrt<0 else 0.0
+                pcrt=float(pc.sum())
+                bpc=1.0 if int((pc>0).sum())>=2 and pcrt>0 else 0.0
+                spc=1.0 if int((pc<0).sum())>=2 and pcrt<0 else 0.0
 
-        # v3.1 GRADUATED EXECUTED AGGRESSION:
-        # +/-20% to <30% earns 0.5; +/-30% or stronger earns 1.0.
+        # Executed aggression remains useful but cannot veto persistent price/OI structure.
         ba=sa=0.0
         if pd.notna(td):
             ba=1.0 if td>=30 else 0.5 if td>=20 else 0.0
             sa=1.0 if td<=-30 else 0.5 if td<=-20 else 0.0
+
+        # Displayed order-book imbalance is confirmation only: maximum +/-0.5.
         bi=si=0.0
-        if pd.notna(imb): bi=0.5 if imb>=20 else 0.0; si=0.5 if imb<=-20 else 0.0
+        if pd.notna(imb):
+            bi=0.5 if imb>=20 else 0.0
+            si=0.5 if imb<=-20 else 0.0
 
-        # Directional score excludes direction-neutral OI points until price/state resolves.
-        bull=min(8.0,bp+bs+bf+bpc+ba+bi)
-        bear=min(8.0,sp+ss+sf+spc+sa+si)
+        ce_doi=pe_doi=None
+        oi50_state=""
+        option_bull_confirm=option_bear_confirm=False
+        if not ee.empty:
+            ce_doi,pe_doi,oi50_state,option_bull_confirm,option_bear_confirm=_option_regime(ee.iloc[-1])
+
+        # Option positioning contributes explicit directional confirmation.
+        option_bull_points=1.5 if option_bull_confirm and oi50_state=="PUT BUILD / CALL UNWIND" else 1.0 if option_bull_confirm else 0.0
+        option_bear_points=1.5 if option_bear_confirm and oi50_state=="CALL BUILD / PUT UNWIND" else 1.0 if option_bear_confirm else 0.0
+
+        bull=min(8.0,bp+bs+bf+bpc+ba+bi+option_bull_points)
+        bear=min(8.0,sp+ss+sf+spc+sa+si+option_bear_points)
+
+        # Evidence decay: once 2/3 recent futures regimes contradict the prior
+        # direction, old directional evidence loses half its carry immediately.
+        reversal_watch=None
+        if prior_direction=="SHORT" and bull_last3>=2:
+            bear*=0.5
+            reversal_watch="BULLISH REVERSAL WATCH"
+        elif prior_direction=="LONG" and bear_last3>=2:
+            bull*=0.5
+            reversal_watch="BEARISH REVERSAL WATCH"
+
+        # Price acceptance: latest two spot observations must accept the new direction.
+        recent_spot=pd.to_numeric(
+            eg[pd.to_datetime(eg.ts)<=ts].get("spot",pd.Series(dtype=float)),
+            errors="coerce"
+        ).dropna().tail(3)
+        bull_accept=len(recent_spot)>=3 and recent_spot.iloc[-1]>recent_spot.iloc[-2]>recent_spot.iloc[-3]
+        bear_accept=len(recent_spot)>=3 and recent_spot.iloc[-1]<recent_spot.iloc[-2]<recent_spot.iloc[-3]
+
+        # Structural confirmation differs for fresh positioning vs covering/unwinding.
+        fresh_long_confirm=(bull_last4>=3 and pd.notna(cumoi) and cumoi>0 and option_bull_confirm and bull_accept)
+        covering_confirm=(bull_last4>=3 and pd.notna(cumoi) and cumoi<=0 and option_bull_confirm and bull_accept)
+        fresh_short_confirm=(bear_last4>=3 and pd.notna(cumoi) and cumoi>0 and option_bear_confirm and bear_accept)
+        unwind_confirm=(bear_last4>=3 and pd.notna(cumoi) and cumoi<=0 and option_bear_confirm and bear_accept)
+
+        structural_state=None
+        structural_direction=None
+        if fresh_long_confirm:
+            structural_state="BUILDING LONG — FRESH LONG BUILD"
+            structural_direction="LONG"
+        elif covering_confirm:
+            structural_state="BULLISH SHORT COVERING"
+            structural_direction="LONG"
+        elif fresh_short_confirm:
+            structural_state="BUILDING SHORT — FRESH SHORT BUILD"
+            structural_direction="SHORT"
+        elif unwind_confirm:
+            structural_state="BEARISH LONG UNWINDING"
+            structural_direction="SHORT"
+
+        # Three-snapshot reversal lock. One isolated opposite bar cannot flip the state.
+        if locked_direction and lock_remaining>0:
+            opposite_break=(
+                (locked_direction=="LONG" and bear_last3>=2 and bear_accept and option_bear_confirm)
+                or (locked_direction=="SHORT" and bull_last3>=2 and bull_accept and option_bull_confirm)
+            )
+            if not opposite_break:
+                structural_direction=locked_direction
+                if structural_state is None:
+                    structural_state="LOCKED "+locked_direction
+                lock_remaining-=1
+            else:
+                locked_direction=None
+                lock_remaining=0
+
+        if structural_direction and structural_direction!=locked_direction:
+            locked_direction=structural_direction
+            lock_remaining=3
+
         direction="LONG" if bull>bear else "SHORT" if bear>bull else "MIXED"
+        if structural_direction:
+            direction=structural_direction
 
-        # Full conviction score includes fresh-positioning OI /2, but do not call
-        # it CONFIRMED directional unless directional evidence itself is strong.
         score=min(10.0,max(bull,bear)+oi_points)
         directional_score=max(bull,bear)
 
-        if oi_points>=2 and directional_score<4:
+        if structural_state:
+            state=structural_state
+        elif reversal_watch:
+            state=reversal_watch
+        elif oi_points>=2 and directional_score<4:
             state="OI BUILDING — DIRECTION UNRESOLVED"
         elif score>=8.5 and directional_score>=6:
             state="HIGH CONVICTION "+direction
@@ -200,6 +324,10 @@ def state_history(symbol,eng,optb,agg):
             state="FRESH OI — DIRECTION UNRESOLVED"
         else:
             state="NEUTRAL"
+
+        prior_direction=direction if direction in ("LONG","SHORT") else prior_direction
+        prior_bull=bull
+        prior_bear=bear
         conv="VERY HIGH" if score>=8.5 else "HIGH" if score>=7 else "MEDIUM" if score>=6 else "LOW"
         hist.append({"symbol":symbol,"ts":ts,"state":state,"conviction":conv,"score":score,"direction":direction,"bull_score":bull,"bear_score":bear,
                      "option_bull_score":0,"option_bear_score":0,"option_persistence":0,"qty_imbalance":imb,"aggression_persistence":0,
@@ -209,12 +337,18 @@ def state_history(symbol,eng,optb,agg):
                      "directional_score":directional_score,
                      "futures_state":fstate,"futures_state_persistence":persist,
                      "futures_state_points":statepts,"total_flow_3m_cr":flow,"money_flow_acceleration_x":flowx,"money_flow_points":fp,
-                     "pcr_trend_9m":pcrt,"pcr_trend_points":max(bpc,spc),"aggression_points":max(ba,sa),"imbalance_points":max(bi,si)})
+                     "pcr_trend_9m":pcrt,"pcr_trend_points":max(bpc,spc),"aggression_points":max(ba,sa),"imbalance_points":max(bi,si),
+                     "regime":fstate,"bull_regimes_last3":bull_last3,"bear_regimes_last3":bear_last3,
+                     "bull_regimes_last4":bull_last4,"bear_regimes_last4":bear_last4,
+                     "option_oi_state":oi50_state,"ce_doi_t0":ce_doi,"pe_doi_t0":pe_doi,
+                     "option_bull_confirmation":option_bull_confirm,"option_bear_confirmation":option_bear_confirm,
+                     "price_accept_long":bull_accept,"price_accept_short":bear_accept,
+                     "reversal_watch":reversal_watch,"locked_direction":locked_direction,"lock_remaining":lock_remaining})
     return pd.DataFrame(hist)
 
 d,eng,opt,agg,uni=load_all()
-st.title("NIFTY + BANKNIFTY — Early Detector v3.1 Index-Calibrated")
-st.caption("Score /10: 9-minute price persistence 2 • Fresh OI positioning 2 (direction-neutral) • Futures-state persistence 2 • Money-flow expansion 1.5 • PCR trend 1 • Graduated aggression 1 • Qty imbalance 0.5. CONFIRMED still requires total >=7 and directional >=5.")
+st.title("NIFTY + BANKNIFTY — Early Detector v3.2 Four-Regime Reversal-Lock")
+st.caption("v3.2: four futures regimes • explicit PE/CE OI confirmation • reversal watch + evidence decay • 3-snapshot reversal lock • price acceptance • qty imbalance capped at 0.5. Fresh long/short build is separated from short-covering/long-unwinding.")
 
 if d is None:
     st.info("Waiting for index collector data.")
@@ -265,7 +399,10 @@ with tabs[0]:
         with st.expander(f"{sym} state lifecycle"):
             view=h[["ts","state","conviction","score","option_bull_score","option_bear_score",
                     "qty_imbalance","session_price_pct","price_3m_pct","oi_3m_pct",
-                    "cumulative_oi_pct","price_persistence_points","oi_confirmation_points","futures_state","futures_state_persistence","futures_state_points","total_flow_3m_cr","money_flow_acceleration_x","money_flow_points","pcr_trend_9m","pcr_trend_points","aggression_points","imbalance_points"]].copy()
+                    "cumulative_oi_pct","price_persistence_points","oi_confirmation_points","futures_state","futures_state_persistence","futures_state_points","total_flow_3m_cr","money_flow_acceleration_x","money_flow_points","pcr_trend_9m","pcr_trend_points","aggression_points","imbalance_points",
+                     "regime","bull_regimes_last3","bear_regimes_last3","bull_regimes_last4","bear_regimes_last4",
+                     "option_oi_state","ce_doi_t0","pe_doi_t0","option_bull_confirmation","option_bear_confirmation",
+                     "price_accept_long","price_accept_short","reversal_watch","locked_direction","lock_remaining"]].copy()
             view["ts"]=view["ts"].apply(lambda x:tist(x).strftime("%H:%M:%S"))
             st.dataframe(view,use_container_width=True,hide_index=True)
 
